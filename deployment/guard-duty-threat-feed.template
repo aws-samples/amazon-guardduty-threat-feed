@@ -1,0 +1,355 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description" : "Guard Duty Threat Feed: Automatically keeps FIRE_EYE feeds updated. **NOTICE** Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.",
+  "Parameters": {
+    "PublicKey": {
+      "Description": "Insert your 3rd party public key",
+      "Type": "String"
+    },
+    "PrivateKey": {
+      "Description": "Insert your 3rd party private key",
+      "Type": "String"
+    },
+    "DaysRequested": {
+      "Description": "Insert the maximum age (in days) of the threats you want to collect (min 1 - max 30)",
+      "Default" : "7",
+      "MinValue": "1",
+      "MaxValue": "30",
+      "Type": "Number"
+    },
+    "Frequency": {
+      "Description": "Insert the number of days between executions - when the solution downloads a new threat feed (min 1 - max 29)",
+      "Default" : "6",
+      "MinValue": "1",
+      "MaxValue": "29",
+      "Type": "Number"
+    }
+  },
+  "Metadata" : {
+    "AWS::CloudFormation::Interface" : {
+     "ParameterGroups" : [
+      {
+        "Label" : { "default":"Partner Access Key" },
+        "Parameters" : [ "PublicKey",  "PrivateKey"]
+      },
+      {
+        "Label" : { "default":"Advanced Settings" },
+        "Parameters" : [ "DaysRequested", "Frequency"]
+      }
+     ],
+     "ParameterLabels" : {
+        "PublicKey" : { "default" : "Public Key" },
+        "PrivateKey" : { "default" : "Private Key" },
+        "DaysRequested" : { "default" : "Days Requested" },
+        "Frequency" : { "default" : "Frequency" }
+     }
+    }
+  },
+  "Conditions": {
+    "Singular": {"Fn::Equals": [{"Ref": "Frequency"}, "1"]}
+  },
+  "Mappings": {
+    "SourceCode": {
+      "General": {
+        "S3Bucket": "%%BUCKET_NAME%%",
+        "KeyPrefix": "%%BUCKET_KEY_PREFIX%%/%%VERSION%%"
+      }
+    }
+  },
+  "Resources": {
+    "GDThreatFeedOutputBucket": {
+      "Type" : "AWS::S3::Bucket",
+      "DeletionPolicy": "Retain",
+      "Properties" : {
+        "AccessControl" : "Private"
+      }
+    },
+    "CopyLambdaCodeRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Service": ["lambda.amazonaws.com"]},"Action": [ "sts:AssumeRole" ]
+          }]
+        },
+        "Path": "/",
+        "RoleName": {"Fn::Join": ["",[{"Ref": "AWS::StackName"},"CLCRole-",{"Ref": "AWS::Region"}]]},
+        "Policies": [{
+          "PolicyName": {"Fn::Join": ["", [{"Ref": "AWS::StackName"}, "CLCLogPolicy"]]},
+          "PolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Effect": "Allow",
+              "Action": [
+                "logs:CreateLogGroup",
+                "logs:CreateLogStream",
+                "logs:PutLogEvents"
+              ],
+              "Resource": { "Fn::Join" : ["", ["arn:aws:logs:",{"Ref" : "AWS::Region"},":",{ "Ref" : "AWS::AccountId" }, ":log-group:/aws/lambda/*" ]]}
+            }]
+          }
+        }, {
+          "PolicyName": {"Fn::Join": ["", [{"Ref": "AWS::StackName"}, "CLCS3Access"]]},
+          "PolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Effect": "Allow",
+              "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:DeleteObject"
+              ],
+              "Resource": {"Fn::Join": ["", [{"Fn::GetAtt": ["GDThreatFeedOutputBucket", "Arn"]}, "/*"]]}
+            }]
+          }
+        }]
+      }
+    },
+    "CopyLambdaCodeFunction": {
+      "Type": "AWS::Lambda::Function",
+      "DependsOn": ["GDThreatFeedOutputBucket", "CopyLambdaCodeRole"],
+      "Properties": {
+        "Code": {
+          "ZipFile":  { "Fn::Join": ["\n", [
+            "import boto3",
+            "import json",
+            "from botocore.vendored import requests",
+            "def send_response(event, context):",
+            "    responseBody = {}",
+            "    responseBody['Status'] = 'SUCCESS'",
+            "    responseBody['PhysicalResourceId'] = context.log_stream_name",
+            "    responseBody['StackId'] = event['StackId']",
+            "    responseBody['RequestId'] = event['RequestId']",
+            "    responseBody['LogicalResourceId'] = event['LogicalResourceId']",
+            "    responseBody['NoEcho'] = False",
+            "    responseBody['Data'] = {}",
+            "    json_responseBody = json.dumps(responseBody)",
+            "    headers = {'content-type': '', 'content-length': str(len(json_responseBody))}",
+            "    try:",
+            "        response = requests.put(event['ResponseURL'], data = json_responseBody, headers = headers)",
+            "    except Exception as e:",
+            "        print e",
+            "def lambda_handler(event, context):",
+            "    try:",
+            "        print event",
+            "        s3_client = boto3.client('s3')",
+            "        request_type = event['RequestType'].upper()",
+            "        source_bucket_name = event['ResourceProperties']['SourceBucketName']",
+            "        dest_bucket_name = event['ResourceProperties']['DestBucketName']",
+            "        object_keys = event['ResourceProperties']['ObjectKeys']",
+            "        if len(object_keys) > 0:",
+            "            # URL Prefix",
+            "            prefix = 'https://s3.amazonaws.com/' + source_bucket_name + '/'",
+            "            response = requests.head(prefix + object_keys[0])",
+            "            region_code = response.headers['x-amz-bucket-region']",
+            "            if region_code != 'us-east-1':",
+            "                prefix = prefix.replace('https://s3', 'https://s3-'+region_code)",
+            "            # Process each entry",
+            "            for k in object_keys:",
+            "                try:",
+            "                    file_name =  k.split('/')[-1]",
+            "                    local_file_path = '/tmp/' + file_name",
+            "                    if 'CREATE' in request_type or 'UPDATE' in request_type:",
+            "                        response = requests.get(prefix + k)",
+            "                        open(local_file_path, 'wb').write(response.content)",
+            "                        s3_client.upload_file(local_file_path, dest_bucket_name, k)",
+            "                    elif 'DELETE' in request_type:",
+            "                        s3_client.delete_object(Bucket=dest_bucket_name, Key=k)",
+            "                except Exception as e:",
+            "                    print e",
+            "    except Exception as e:",
+            "        print e",
+            "    finally:",
+            "        send_response(event, context)"
+          ]]}
+        },
+        "MemorySize": "512",
+        "Handler": "index.lambda_handler",
+        "Role": {"Fn::GetAtt": ["CopyLambdaCodeRole", "Arn"]},
+        "Timeout": "300",
+        "Runtime": "python2.7",
+        "Description": "Copy Lambda Code Function"
+      }
+    },
+    "CopyLambdaCodeEvent": {
+      "Type": "Custom::CopyLambdaCodeEvent",
+      "DependsOn": "CopyLambdaCodeFunction",
+      "Properties": {
+        "ServiceToken": {"Fn::GetAtt": ["CopyLambdaCodeFunction","Arn"]},
+        "SourceBucketName": {"Fn::FindInMap": ["SourceCode", "General", "S3Bucket"]},
+        "DestBucketName": {"Ref": "GDThreatFeedOutputBucket"},
+        "ObjectKeys": [
+          {"Fn::Join": ["/", [{"Fn::FindInMap": ["SourceCode", "General", "KeyPrefix"]}, "guard-duty-threat-feed.zip"]]}
+        ]
+      }
+    },
+    "GDThreatFeedPublicKey": {
+       "Type": "AWS::SSM::Parameter",
+       "Properties": {
+          "Type": "String",
+          "Value": {"Ref": "PublicKey"},
+          "Description": "Guard Duty Threat Feed 3rd party public key"
+       }
+    },
+    "GDThreatFeedPrivateKey": {
+       "Type": "AWS::SSM::Parameter",
+       "Properties": {
+          "Type": "String",
+          "Value": {"Ref": "PrivateKey"},
+          "Description": "Guard Duty Threat Feed 3rd party private key"
+       }
+    },
+    "GDThreatFeedRole": {
+      "Type": "AWS::IAM::Role",
+      "DependsOn": ["GDThreatFeedOutputBucket"],
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Service": ["lambda.amazonaws.com"]},"Action": [ "sts:AssumeRole" ]
+          }]
+        },
+        "Path": "/",
+        "RoleName": {"Fn::Join": ["",[{"Ref": "AWS::StackName"},"Role-",{"Ref": "AWS::Region"}]]},
+        "Policies": [{
+          "PolicyName": {"Fn::Join": ["", [{"Ref": "AWS::StackName"}, "LogPolicy"]]},
+          "PolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Effect": "Allow",
+              "Action": [
+                "logs:CreateLogGroup",
+                "logs:CreateLogStream",
+                "logs:PutLogEvents"
+              ],
+              "Resource": { "Fn::Join" : ["", ["arn:aws:logs:",{"Ref" : "AWS::Region"},":",{ "Ref" : "AWS::AccountId" }, ":log-group:/aws/lambda/*" ]]}
+            }]
+          }
+        }, {
+          "PolicyName": {"Fn::Join": ["", [{"Ref": "AWS::StackName"}, "GuardDutyAccess"]]},
+          "PolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Effect": "Allow",
+              "Action": [
+                "guardduty:ListDetectors",
+                "guardduty:CreateThreatIntelSet",
+                "guardduty:GetThreatIntelSet",
+                "guardduty:ListThreatIntelSets",
+                "guardduty:UpdateThreatIntelSet"
+              ],
+              "Resource": {"Fn::Join": ["", ["arn:aws:guardduty:", {"Ref": "AWS::Region"}, ":", {"Ref": "AWS::AccountId"}, ":detector/*"]]}
+            }, {
+              "Effect": "Allow",
+              "Action": [
+                  "iam:PutRolePolicy",
+                  "iam:DeleteRolePolicy"
+              ],
+              "Resource": {"Fn::Join": ["", ["arn:aws:iam::", {"Ref": "AWS::AccountId"}, ":role/aws-service-role/guardduty.amazonaws.com/AWSServiceRoleForAmazonGuardDuty"]]}
+            }]
+          }
+        }, {
+          "PolicyName": {"Fn::Join": ["", [{"Ref": "AWS::StackName"}, "S3Access"]]},
+          "PolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Effect": "Allow",
+              "Action": [
+                "s3:GetObject",
+                "s3:PutObject"
+              ],
+              "Resource": {"Fn::Join": ["", ["arn:aws:s3:::", {"Ref": "GDThreatFeedOutputBucket"}, "/*"]]}
+            }]
+          }
+        }, {
+          "PolicyName": {"Fn::Join": ["", [{"Ref": "AWS::StackName"}, "SSMParametersAccess"]]},
+          "PolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Effect": "Allow",
+              "Action": [
+                "ssm:GetParameters"
+              ],
+              "Resource": {"Fn::Join": ["", ["arn:aws:ssm:", {"Ref": "AWS::Region"}, ":", {"Ref": "AWS::AccountId"}, ":parameter/", {"Ref": "GDThreatFeedPublicKey"}]]}
+            }, {
+              "Effect": "Allow",
+              "Action": [
+                "ssm:GetParameters"
+              ],
+              "Resource": {"Fn::Join": ["", ["arn:aws:ssm:", {"Ref": "AWS::Region"}, ":", {"Ref": "AWS::AccountId"}, ":parameter/", {"Ref": "GDThreatFeedPrivateKey"}]]}
+            }]
+          }
+        }]
+      }
+    },
+    "GDThreatFeedFunction": {
+      "Type": "AWS::Lambda::Function",
+      "DependsOn": ["GDThreatFeedRole", "GDThreatFeedPublicKey", "GDThreatFeedPrivateKey"],
+      "Properties": {
+        "Code": {
+          "S3Bucket": {"Ref": "GDThreatFeedOutputBucket"},
+          "S3Key": "%%BUCKET_KEY_PREFIX%%/%%VERSION%%/guard-duty-threat-feed.zip"
+        },
+        "MemorySize": "3008",
+        "Handler": "lambda_function.lambda_handler",
+        "Role": {"Fn::GetAtt": ["GDThreatFeedRole", "Arn"]},
+        "Timeout": "300",
+        "Runtime": "python2.7",
+        "Description": "GuardDuty threat feed auto update",
+        "Environment": {
+            "Variables": {
+              "LOG_LEVEL": "INFO",
+              "DAYS_REQUESTED": {"Ref": "DaysRequested"},
+              "PUBLIC_KEY": {"Ref": "GDThreatFeedPublicKey"},
+              "PRIVATE_KEY": {"Ref": "GDThreatFeedPrivateKey"},
+              "OUTPUT_BUCKET": {"Ref": "GDThreatFeedOutputBucket"}
+          }
+        }
+      }
+    },
+    "GDThreatFeedFunctionFirstRun": {
+      "Type": "Custom::FirstRun",
+      "DependsOn": ["GDThreatFeedFunction"],
+      "Properties": {
+        "ServiceToken": {"Fn::GetAtt": ["GDThreatFeedFunction","Arn"]}
+      }
+    },
+    "GDThreatFeedScheduler": {
+      "Type": "AWS::Events::Rule",
+      "DependsOn": ["GDThreatFeedFunction"],
+      "Properties": {
+        "Description": "GuardDuty threat feed auto update scheduler",
+        "ScheduleExpression": {"Fn::Join": ["", ["rate(", {"Ref":"Frequency"}, {"Fn::If":["Singular", " day)", " days)"]}]]},
+        "Targets": [{
+          "Arn": {
+            "Fn::GetAtt": [
+              "GDThreatFeedFunction",
+              "Arn"
+            ]
+          },
+          "Id": "GDThreatFeedFunction"
+        }]
+      }
+    },
+    "GDThreatFeedSchedulerInvokePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "DependsOn": ["GDThreatFeedScheduler"],
+      "Properties": {
+        "FunctionName": {
+          "Ref": "GDThreatFeedFunction"
+        },
+        "Action": "lambda:InvokeFunction",
+        "Principal": "events.amazonaws.com",
+        "SourceArn": {
+          "Fn::GetAtt": [
+            "GDThreatFeedScheduler",
+            "Arn"
+          ]
+        }
+      }
+    }
+  }
+}
