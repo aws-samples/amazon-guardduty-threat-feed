@@ -66,6 +66,7 @@
     },
     "CopyLambdaCodeRole": {
       "Type": "AWS::IAM::Role",
+      "DependsOn": ["GDThreatFeedOutputBucket"],
       "Properties": {
         "AssumeRolePolicyDocument": {
           "Version": "2012-10-17",
@@ -143,9 +144,8 @@
             "            # URL Prefix",
             "            prefix = 'https://s3.amazonaws.com/' + source_bucket_name + '/'",
             "            response = requests.head(prefix + object_keys[0])",
-            "            region_code = response.headers['x-amz-bucket-region']",
-            "            if region_code != 'us-east-1':",
-            "                prefix = prefix.replace('https://s3', 'https://s3-'+region_code)",
+            "            if 'x-amz-bucket-region' in response.headers and response.headers['x-amz-bucket-region'] != 'us-east-1':",
+            "                prefix = prefix.replace('https://s3', 'https://s3-'+response.headers['x-amz-bucket-region'])",
             "            # Process each entry",
             "            for k in object_keys:",
             "                try:",
@@ -175,7 +175,7 @@
     },
     "CopyLambdaCodeEvent": {
       "Type": "Custom::CopyLambdaCodeEvent",
-      "DependsOn": "CopyLambdaCodeFunction",
+      "DependsOn": ["CopyLambdaCodeFunction", "GDThreatFeedOutputBucket"],
       "Properties": {
         "ServiceToken": {"Fn::GetAtt": ["CopyLambdaCodeFunction","Arn"]},
         "SourceBucketName": {"Fn::FindInMap": ["SourceCode", "General", "S3Bucket"]},
@@ -203,7 +203,7 @@
     },
     "GDThreatFeedRole": {
       "Type": "AWS::IAM::Role",
-      "DependsOn": ["GDThreatFeedOutputBucket"],
+      "DependsOn": ["GDThreatFeedOutputBucket", "GDThreatFeedPublicKey", "GDThreatFeedPrivateKey"],
       "Properties": {
         "AssumeRolePolicyDocument": {
           "Version": "2012-10-17",
@@ -287,7 +287,7 @@
     },
     "GDThreatFeedFunction": {
       "Type": "AWS::Lambda::Function",
-      "DependsOn": ["GDThreatFeedRole", "GDThreatFeedPublicKey", "GDThreatFeedPrivateKey"],
+      "DependsOn": ["GDThreatFeedOutputBucket", "CopyLambdaCodeEvent", "GDThreatFeedRole", "GDThreatFeedPublicKey", "GDThreatFeedPrivateKey"],
       "Properties": {
         "Code": {
           "S3Bucket": {"Ref": "GDThreatFeedOutputBucket"},
@@ -336,7 +336,7 @@
     },
     "GDThreatFeedSchedulerInvokePermission": {
       "Type": "AWS::Lambda::Permission",
-      "DependsOn": ["GDThreatFeedScheduler"],
+      "DependsOn": ["GDThreatFeedFunction", "GDThreatFeedScheduler"],
       "Properties": {
         "FunctionName": {
           "Ref": "GDThreatFeedFunction"
